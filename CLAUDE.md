@@ -1,4 +1,3 @@
-
 Default to using Bun instead of Node.js.
 
 - Use `bun <file>` instead of `node <file>` or `ts-node <file>`
@@ -31,76 +30,35 @@ test("hello world", () => {
 });
 ```
 
-## Frontend
+---
 
-Use HTML imports with `Bun.serve()`. Don't use `vite`. HTML imports fully support React, CSS, Tailwind.
+# Discotractor - Discord Summarizer
 
-Server:
+## Project Requirements
 
-```ts#index.ts
-import index from "./index.html"
+### What it does
+- Exports messages from ALL available channels on a Discord server
+- Summarizes each channel SEPARATELY (e.g., summary of "general", summary of "trading", etc.)
+- Posts summaries to a Discord webhook
 
-Bun.serve({
-  routes: {
-    "/": index,
-    "/api/users/:id": {
-      GET: (req) => {
-        return new Response(JSON.stringify({ id: req.params.id }));
-      },
-    },
-  },
-  // optional websocket support
-  websocket: {
-    open: (ws) => {
-      ws.send("Hello, world!");
-    },
-    message: (ws, message) => {
-      ws.send(message);
-    },
-    close: (ws) => {
-      // handle close
-    }
-  },
-  development: {
-    hmr: true,
-    console: true,
-  }
-})
-```
+### Ignored channels
+- intro-votes
+- introduce-yourself
+- lobby
 
-HTML files can import .tsx, .jsx or .js files directly and Bun's bundler will transpile & bundle automatically. `<link>` tags can point to stylesheets and Bun's CSS bundler will bundle.
+### Summarization prompt focus
+Find and extract:
+- Usable trading or farming ideas
+- Important project updates or news
+- Airdrop notifications
 
-```html#index.html
-<html>
-  <body>
-    <h1>Hello, world!</h1>
-    <script type="module" src="./frontend.tsx"></script>
-  </body>
-</html>
-```
+**Always keep the poster's name when quoting a message.**
 
-With the following `frontend.tsx`:
+### OpenRouter model
+**ONLY use: grok-4.1-fast** (x.ai model via OpenRouter)
 
-```tsx#frontend.tsx
-import React from "react";
-import { createRoot } from "react-dom/client";
-
-// import .css files directly and it works
-import './index.css';
-
-const root = createRoot(document.body);
-
-export default function Frontend() {
-  return <h1>Hello, world!</h1>;
-}
-
-root.render(<Frontend />);
-```
-
-Then, run index.ts
-
-```sh
-bun --hot ./index.ts
-```
-
-For more information, read the Bun API docs in `node_modules/bun-types/docs/**.mdx`.
+### Environment variables (in .env)
+- OPENROUTER_API_KEY
+- DISCORD_WEBHOOK_URL
+- DISCORD_TOKEN
+- GUILD_ID
