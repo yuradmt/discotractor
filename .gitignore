@@ -13,6 +13,10 @@ coverage
 # logs
 logs
 _.log
+cron.log
+
+# database
+messages.db
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # dotenv environment variable files
