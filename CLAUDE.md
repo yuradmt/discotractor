@@ -1,52 +1,16 @@
-Default to using Bun instead of Node.js.
-
-- Use `bun <file>` instead of `node <file>` or `ts-node <file>`
-- Use `bun test` instead of `jest` or `vitest`
-- Use `bun build <file.html|file.ts|file.css>` instead of `webpack` or `esbuild`
-- Use `bun install` instead of `npm install` or `yarn install` or `pnpm install`
-- Use `bun run <script>` instead of `npm run <script>` or `yarn run <script>` or `pnpm run <script>`
-- Use `bunx <package> <command>` instead of `npx <package> <command>`
-- Bun automatically loads .env, so don't use dotenv.
-
-## APIs
-
-- `Bun.serve()` supports WebSockets, HTTPS, and routes. Don't use `express`.
-- `bun:sqlite` for SQLite. Don't use `better-sqlite3`.
-- `Bun.redis` for Redis. Don't use `ioredis`.
-- `Bun.sql` for Postgres. Don't use `pg` or `postgres.js`.
-- `WebSocket` is built-in. Don't use `ws`.
-- Prefer `Bun.file` over `node:fs`'s readFile/writeFile
-- Bun.$`ls` instead of execa.
-
-## Testing
-
-Use `bun test` to run tests.
-
-```ts#index.test.ts
-import { test, expect } from "bun:test";
-
-test("hello world", () => {
-  expect(1).toBe(1);
-});
-```
-
----
-
 # Discotractor - Discord Summarizer
 
-## Project Requirements
-
-### What it does
+## What it does
 - Exports messages from ALL available channels on a Discord server
 - Summarizes each channel SEPARATELY (e.g., summary of "general", summary of "trading", etc.)
 - Posts summaries to a Discord webhook
 
-### Ignored channels
+## Ignored channels
 - intro-votes
 - introduce-yourself
 - lobby
 
-### Summarization prompt focus
+## Summarization prompt focus
 Find and extract:
 - Usable trading or farming ideas
 - Important project updates or news
@@ -54,11 +18,14 @@ Find and extract:
 
 **Always keep the poster's name when quoting a message.**
 
-### OpenRouter model
+## OpenRouter model
 **ONLY use: grok-4.1-fast** (x.ai model via OpenRouter)
 
-### Environment variables (in .env)
-- OPENROUTER_API_KEY
-- DISCORD_WEBHOOK_URL
-- DISCORD_TOKEN
-- GUILD_ID
+## Environment variables
+Uses global vars from ~/.env plus project-specific:
+- DISCORD_WEBHOOK_URL - where to post summaries
+- DISCORD_WEBHOOK_URLS - alternative webhook
+- GUILD_ID - Discord server ID
+
+## Cron
+Runs daily at 23:59 via crontab.

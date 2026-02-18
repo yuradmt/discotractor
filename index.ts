@@ -1,3 +1,52 @@
+import { Database } from "bun:sqlite";
+
+const db = new Database("messages.db");
+db.run(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT NOT NULL,
+    author TEXT NOT NULL,
+    content TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    summarized INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`);
+
+// Migration: add summarized column if it doesn't exist
+try {
+  db.run(`ALTER TABLE messages ADD COLUMN summarized INTEGER DEFAULT 0`);
+} catch {
+  // Column already exists
+}
+db.run(`CREATE INDEX IF NOT EXISTS idx_messages_summarized ON messages(summarized)`);
+db.run(`CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_name)`);
+
+const insertMessage = db.prepare(`
+  INSERT OR IGNORE INTO messages (id, channel_id, channel_name, author, content, timestamp)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const getUnsummarizedMessages = db.prepare(`
+  SELECT id, channel_name, author, content, timestamp
+  FROM messages
+  WHERE summarized = 0
+  ORDER BY channel_name, timestamp ASC
+`);
+
+const getTodayMessages = db.prepare(`
+  SELECT id, channel_name, author, content, timestamp
+  FROM messages
+  WHERE date(timestamp) = date('now')
+  ORDER BY channel_name, timestamp ASC
+`);
+
+const markAsSummarized = db.prepare(`UPDATE messages SET summarized = 1 WHERE id = ?`);
+
+const dryRun = process.argv.includes("--dry-run");
+
 const IGNORED_CHANNELS = [
   "intro-votes",
   "introduce-yourself",
@@ -50,6 +99,14 @@ interface ChannelMessages {
   messages: Message[];
 }
 
+interface DbMessage {
+  id: string;
+  channel_name: string;
+  author: string;
+  content: string;
+  timestamp: string;
+}
+
 async function fetchChannels(): Promise<Channel[]> {
   const res = await fetch(`${DISCORD_API}/guilds/${process.env.GUILD_ID}/channels`, {
     headers: { Authorization: process.env.DISCORD_TOKEN! },
@@ -99,6 +156,7 @@ async function fetchTodayMessages(
       const msgTime = new Date(msg.timestamp).getTime();
       if (msgTime >= todayTimestamp) {
         messages.push(msg);
+        insertMessage.run(msg.id, channelId, channelName, msg.author.username, msg.content, msg.timestamp);
       } else {
         return messages;
       }
@@ -114,6 +172,65 @@ async function fetchTodayMessages(
 async function loadPrompt(): Promise<string> {
   const file = Bun.file("./prompts/hedgefund.md");
   return await file.text();
+}
+
+function getUnsummarizedByChannel(): { channels: ChannelMessages[]; messageIds: string[] } {
+  const rows = getUnsummarizedMessages.all() as DbMessage[];
+  const messageIds = rows.map((r) => r.id);
+
+  const byChannel = new Map<string, Message[]>();
+  for (const row of rows) {
+    if (!byChannel.has(row.channel_name)) {
+      byChannel.set(row.channel_name, []);
+    }
+    byChannel.get(row.channel_name)!.push({
+      id: row.id,
+      content: row.content,
+      author: { username: row.author },
+      timestamp: row.timestamp,
+    });
+  }
+
+  const channels: ChannelMessages[] = [];
+  for (const [channelName, messages] of byChannel) {
+    channels.push({ channelName, messages });
+  }
+
+  return { channels, messageIds };
+}
+
+function getTodayByChannel(): { channels: ChannelMessages[]; messageIds: string[] } {
+  const rows = getTodayMessages.all() as DbMessage[];
+  const messageIds = rows.map((r) => r.id);
+
+  const byChannel = new Map<string, Message[]>();
+  for (const row of rows) {
+    if (!byChannel.has(row.channel_name)) {
+      byChannel.set(row.channel_name, []);
+    }
+    byChannel.get(row.channel_name)!.push({
+      id: row.id,
+      content: row.content,
+      author: { username: row.author },
+      timestamp: row.timestamp,
+    });
+  }
+
+  const channels: ChannelMessages[] = [];
+  for (const [channelName, messages] of byChannel) {
+    channels.push({ channelName, messages });
+  }
+
+  return { channels, messageIds };
+}
+
+function markMessagesAsSummarized(messageIds: string[]) {
+  const tx = db.transaction(() => {
+    for (const id of messageIds) {
+      markAsSummarized.run(id);
+    }
+  });
+  tx();
 }
 
 async function summarize(allChannelMessages: ChannelMessages[]): Promise<string | null> {
@@ -156,7 +273,27 @@ async function summarize(allChannelMessages: ChannelMessages[]): Promise<string 
   return data.choices?.[0]?.message?.content || null;
 }
 
-async function sendToWebhook(content: string) {
+function getWebhookUrls(): string[] {
+  const isTest = process.argv.includes("--test");
+  const isProd = process.argv.includes("--prod");
+  // No flag = send to both (cron behavior)
+  const sendTest = isTest || (!isTest && !isProd);
+  const sendProd = isProd || (!isTest && !isProd);
+  const urls: string[] = [];
+  if (sendTest && process.env.DISCORD_WEBHOOK_URL_TEST) urls.push(process.env.DISCORD_WEBHOOK_URL_TEST);
+  if (sendProd && process.env.DISCORD_WEBHOOK_URL_PROD) {
+    urls.push(...process.env.DISCORD_WEBHOOK_URL_PROD.split(",").map((u) => u.trim()).filter(Boolean));
+  }
+  return urls;
+}
+
+async function sendToWebhooks(content: string) {
+  const webhookUrls = getWebhookUrls();
+  if (webhookUrls.length === 0) {
+    console.error("No webhook URLs configured");
+    return;
+  }
+
   // Discord has 2000 char limit, split into multiple messages if needed
   const chunks: string[] = [];
   let remaining = content;
@@ -175,16 +312,19 @@ async function sendToWebhook(content: string) {
     remaining = remaining.slice(breakPoint);
   }
 
-  for (const chunk of chunks) {
-    const res = await fetch(process.env.DISCORD_WEBHOOK_URL!, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: chunk }),
-    });
-    if (!res.ok) {
-      console.error(`Webhook error: ${res.status}`);
+  for (const webhookUrl of webhookUrls) {
+    console.log(`Sending to webhook: ${webhookUrl.slice(0, 50)}...`);
+    for (const chunk of chunks) {
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: chunk }),
+      });
+      if (!res.ok) {
+        console.error(`Webhook error: ${res.status}`);
+      }
+      await Bun.sleep(500);
     }
-    await Bun.sleep(500);
   }
 }
 
@@ -211,8 +351,13 @@ async function main() {
   // Save any newly discovered no-access channels
   await saveNoAccessChannels(noAccessChannels);
 
-  const totalMessages = allChannelMessages.reduce((sum, cm) => sum + cm.messages.length, 0);
-  console.log(`\nTotal: ${totalMessages} messages across all channels`);
+  const totalFetched = allChannelMessages.reduce((sum, cm) => sum + cm.messages.length, 0);
+  console.log(`\nFetched: ${totalFetched} messages across all channels`);
+
+  // Get messages from DB
+  const { channels: targetChannels, messageIds } = dryRun ? getTodayByChannel() : getUnsummarizedByChannel();
+  const totalMessages = targetChannels.reduce((sum, cm) => sum + cm.messages.length, 0);
+  console.log(`${dryRun ? "Today's" : "Unsummarized"}: ${totalMessages} messages${dryRun ? " (dry-run, won't mark as summarized)" : ""}`);
 
   if (totalMessages === 0) {
     console.log("No messages to summarize");
@@ -220,17 +365,29 @@ async function main() {
   }
 
   console.log("\nGenerating summary with Grok...");
-  const summary = await summarize(allChannelMessages);
+  const summary = await summarize(targetChannels);
 
   if (!summary) {
     console.log("Failed to generate summary");
     return;
   }
 
-  console.log("\nSending to webhook...");
-  await sendToWebhook(`📊 **Daily Alpha Digest**\n${new Date().toDateString()}\n\n${summary}`);
+  if (!dryRun) {
+    markMessagesAsSummarized(messageIds);
+    console.log(`Marked ${messageIds.length} messages as summarized`);
+  }
 
-  console.log("Done!");
+  const skipWebhook = process.argv.includes("--no-webhook");
+  if (skipWebhook) {
+    console.log("\n--no-webhook flag set, skipping webhook send");
+    console.log("\n--- SUMMARY ---\n");
+    console.log(summary);
+  } else {
+    console.log("\nSending to webhooks...");
+    await sendToWebhooks(`📊 **Daily Alpha Digest**\n${new Date().toDateString()}\n\n${summary}`);
+  }
+
+  console.log("\nDone!");
 }
 
 main().catch(console.error);
