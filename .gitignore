@@ -37,3 +37,9 @@ no-access-channels.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# generated outputs / side-task caches
+*.jpg
+sales-cache.json
+fetch2y.log
+list-channels-out.tsv

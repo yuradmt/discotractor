@@ -29,10 +29,16 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?)
 `);
 
+// Recency guard: the digest is "the last day's activity", enforced at both
+// ingestion (fetchTodayMessages only inserts today's) AND here. Without the
+// timestamp bound, any out-of-band insert with summarized=0 — e.g. a manual
+// backfill of a channel's history — gets swept into the next digest even though
+// it's months old. The 2-day window still catches a missed cron day (the next
+// fetch re-inserts the gap) but can't pull in historical backfills.
 const getUnsummarizedMessages = db.prepare(`
   SELECT id, channel_name, author, content, timestamp
   FROM messages
-  WHERE summarized = 0
+  WHERE summarized = 0 AND timestamp >= datetime('now', '-2 days')
   ORDER BY channel_name, timestamp ASC
 `);
 
@@ -252,21 +258,38 @@ async function summarize(allChannelMessages: ChannelMessages[]): Promise<string 
 
   const fullPrompt = `${prompt}\n\n---\n\n**Today's Discord Messages:**\n\n${formatted}`;
 
-  const res = await fetch(OPENROUTER_API, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "x-ai/grok-4.1-fast",
-      messages: [{ role: "user", content: fullPrompt }],
-    }),
-  });
+  // Primary: grok. Fallback: minimax, but ONLY if grok was retired (deprecated 404).
+  // Other failures (rate limit, network, auth) should NOT trigger fallback —
+  // they're transient or environmental and we'd rather log+exit so cron retries.
+  const PRIMARY = "x-ai/grok-4.3";
+  const FALLBACK = "minimax/minimax-m2";
 
+  async function callModel(model: string) {
+    return fetch(OPENROUTER_API, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: fullPrompt }] }),
+    });
+  }
+
+  let res = await callModel(PRIMARY);
   if (!res.ok) {
-    console.error(`OpenRouter error: ${res.status} ${await res.text()}`);
-    return null;
+    const errText = await res.text();
+    const isObsolete = res.status === 404 && /deprecat/i.test(errText);
+    if (isObsolete) {
+      console.warn(`Primary model ${PRIMARY} is obsolete — falling back to ${FALLBACK}`);
+      res = await callModel(FALLBACK);
+      if (!res.ok) {
+        console.error(`Fallback ${FALLBACK} also failed: ${res.status} ${await res.text()}`);
+        return null;
+      }
+    } else {
+      console.error(`OpenRouter error: ${res.status} ${errText}`);
+      return null;
+    }
   }
 
   const data = await res.json();

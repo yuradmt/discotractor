@@ -19,7 +19,14 @@ Find and extract:
 **Always keep the poster's name when quoting a message.**
 
 ## OpenRouter model
-**ONLY use: grok-4.1-fast** (x.ai model via OpenRouter)
+**Primary: x-ai/grok-4.3** (x.ai model via OpenRouter)
+**Fallback: minimax/minimax-m2** — used ONLY when the primary returns a 404 with
+a "deprecated" message. Any other error (rate limit, auth, network) is NOT a
+fallback trigger — those should fail loudly so cron retries the next night.
+
+History: was grok-4.1-fast, xAI deprecated it 2026-05 → OpenRouter started
+returning 404. The fallback exists so the next model retirement doesn't silently
+break the daily summary again.
 
 ## Environment variables
 Uses global vars from ~/.env plus project-specific:
