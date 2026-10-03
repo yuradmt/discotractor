@@ -38,7 +38,7 @@ const insertMessage = db.prepare(`
 const getUnsummarizedMessages = db.prepare(`
   SELECT id, channel_name, author, content, timestamp
   FROM messages
-  WHERE summarized = 0 AND timestamp >= datetime('now', '-2 days')
+  WHERE summarized = 0 AND datetime(timestamp) >= datetime('now', '-24 hours')
   ORDER BY channel_name, timestamp ASC
 `);
 
@@ -63,6 +63,10 @@ const IGNORED_CHANNELS = [
   "raises",
 ];
 
+// Must always be summarized: never auto-ignored on a 403, and a loud error if
+// one disappears from the guild channel list (renamed/moved/lost access).
+const REQUIRED_CHANNELS = ["hyperliquid", "lighter", "plasma", "ethena"];
+
 const IGNORED_CHANNEL_IDS = [
   "1239546875191885874", // tweets
 ];
@@ -85,7 +89,9 @@ async function saveNoAccessChannels(channels: Set<string>): Promise<void> {
 }
 
 const DISCORD_API = "https://discord.com/api/v10";
-const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-opus-5-5";
+const CLAUDE_EFFORT = process.env.CLAUDE_EFFORT || "high";
+const CLAUDE_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface Channel {
   id: string;
@@ -119,9 +125,9 @@ async function fetchChannels(): Promise<Channel[]> {
   });
   if (!res.ok) throw new Error(`Failed to fetch channels: ${res.status}`);
   const channels: Channel[] = await res.json();
-  // type 0 = text channel
+  // type 0 = text channel, 5 = announcement channel (exploit-alerts, airdrops)
   return channels.filter(
-    (c) => c.type === 0 && !IGNORED_CHANNELS.includes(c.name) && !IGNORED_CHANNEL_IDS.includes(c.id)
+    (c) => (c.type === 0 || c.type === 5) && !IGNORED_CHANNELS.includes(c.name) && !IGNORED_CHANNEL_IDS.includes(c.id)
   );
 }
 
@@ -130,9 +136,8 @@ async function fetchTodayMessages(
   channelName: string,
   noAccessChannels: Set<string>
 ): Promise<Message[]> {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const todayTimestamp = today.getTime();
+  // Rolling 24h, matching the window getUnsummarizedMessages summarizes.
+  const todayTimestamp = Date.now() - 24 * 60 * 60 * 1000;
 
   const messages: Message[] = [];
   let lastId: string | undefined;
@@ -146,7 +151,9 @@ async function fetchTodayMessages(
       headers: { Authorization: process.env.DISCORD_TOKEN! },
     });
     if (!res.ok) {
-      if (res.status === 403) {
+      if (res.status === 403 && REQUIRED_CHANNELS.includes(channelName)) {
+        console.error(`  ✖ No access to REQUIRED #${channelName} (403) — not adding to ignore list`);
+      } else if (res.status === 403) {
         noAccessChannels.add(channelId);
         console.error(`  ⚠ No access to #${channelName} - saved to ignore list`);
       } else {
@@ -258,42 +265,45 @@ async function summarize(allChannelMessages: ChannelMessages[]): Promise<string 
 
   const fullPrompt = `${prompt}\n\n---\n\n**Today's Discord Messages:**\n\n${formatted}`;
 
-  // Primary: grok. Fallback: minimax, but ONLY if grok was retired (deprecated 404).
-  // Other failures (rate limit, network, auth) should NOT trigger fallback —
-  // they're transient or environmental and we'd rather log+exit so cron retries.
-  const PRIMARY = "x-ai/grok-4.3";
-  const FALLBACK = "minimax/minimax-m2";
+  // Local Claude Code (`claude -p`, Max subscription) — replaced OpenRouter
+  // 2026-10 after the account ran out of credits and posts silently stopped.
+  // cron has a minimal PATH, so add ~/.local/bin where `claude` lives.
+  const home = process.env.HOME ?? "";
+  const PATH = [`${home}/.local/bin`, `${home}/.bun/bin`, process.env.PATH ?? ""].filter(Boolean).join(":");
 
-  async function callModel(model: string) {
-    return fetch(OPENROUTER_API, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: fullPrompt }] }),
-    });
+  const proc = Bun.spawn(["claude", "-p", "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT, "--output-format", "json"], {
+    cwd: import.meta.dir,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, PATH },
+  });
+  proc.stdin.write(fullPrompt);
+  await proc.stdin.end();
+
+  const timer = setTimeout(() => proc.kill(), CLAUDE_TIMEOUT_MS);
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  clearTimeout(timer);
+
+  if (code !== 0) {
+    console.error(`claude -p exit ${code}: ${err.slice(0, 500)}`);
+    return null;
   }
-
-  let res = await callModel(PRIMARY);
-  if (!res.ok) {
-    const errText = await res.text();
-    const isObsolete = res.status === 404 && /deprecat/i.test(errText);
-    if (isObsolete) {
-      console.warn(`Primary model ${PRIMARY} is obsolete — falling back to ${FALLBACK}`);
-      res = await callModel(FALLBACK);
-      if (!res.ok) {
-        console.error(`Fallback ${FALLBACK} also failed: ${res.status} ${await res.text()}`);
-        return null;
-      }
-    } else {
-      console.error(`OpenRouter error: ${res.status} ${errText}`);
+  try {
+    const json = JSON.parse(out) as { result?: string; is_error?: boolean; subtype?: string };
+    if (json.is_error) {
+      console.error(`claude -p error (${json.subtype}): ${json.result?.slice(0, 500)}`);
       return null;
     }
+    return json.result?.trim() || null;
+  } catch {
+    console.error(`claude -p returned non-JSON: ${out.slice(0, 500)}`);
+    return null;
   }
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || null;
 }
 
 function getWebhookUrls(): string[] {
@@ -341,7 +351,8 @@ async function sendToWebhooks(content: string) {
       const res = await fetch(webhookUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: chunk }),
+        // flags: 4 = SUPPRESS_EMBEDS — no link previews under the digest
+        body: JSON.stringify({ content: chunk, flags: 4 }),
       });
       if (!res.ok) {
         console.error(`Webhook error: ${res.status}`);
@@ -359,7 +370,9 @@ async function main() {
   console.log("Fetching channels...");
   let channels = await fetchChannels();
   // Filter out channels we already know we can't access
-  channels = channels.filter((c) => !noAccessChannels.has(c.id));
+  channels = channels.filter((c) => !noAccessChannels.has(c.id) || REQUIRED_CHANNELS.includes(c.name));
+  const missing = REQUIRED_CHANNELS.filter((name) => !channels.some((c) => c.name === name));
+  if (missing.length) console.error(`✖ Required channels not found in guild: ${missing.map((n) => `#${n}`).join(", ")}`);
   console.log(`Found ${channels.length} text channels (excluding ignored)`);
 
   const allChannelMessages: ChannelMessages[] = [];
@@ -387,7 +400,7 @@ async function main() {
     return;
   }
 
-  console.log("\nGenerating summary with Grok...");
+  console.log(`\nGenerating summary with claude -p (${CLAUDE_MODEL}, ${CLAUDE_EFFORT})...`);
   const summary = await summarize(targetChannels);
 
   if (!summary) {
